@@ -58,7 +58,6 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""
     args = get_args()
     config = core_transformer_config_from_args(args)
-    args = get_args()
     
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage) and (
@@ -83,6 +82,22 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 cu_seqlens_padded, max_seqlen, local_cp_size=local_cp_size)
         
     else:
+        # #debugmtl
+        # sample_length = batch['tokens'].shape[1]
+        # if args.sft:
+        #     packed_seq_params = PackedSeqParams(
+        #     qkv_format="sbhd",
+        #     cu_seqlens_q=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        #     cu_seqlens_kv=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        #     cu_seqlens_q_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        #     cu_seqlens_kv_padded=torch.tensor([0, sample_length], device="cuda", pin_memory=True),
+        #     max_seqlen_q=sample_length,
+        #     max_seqlen_kv=sample_length,
+        #     local_cp_size=None,
+        #     cp_group=None,
+        # )
+        # else:
+        #     packed_seq_params = None
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None

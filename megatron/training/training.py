@@ -476,7 +476,7 @@ def num_floating_point_operations(args, num_total_tokens_this_GB, sequence_squar
             )
             +                
             # Self Attention
-            standard_self_attn_term
+            self_attn_term
             
         )
         return total_floating_point_operations
@@ -1460,6 +1460,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     val,
                     group=mpu.get_data_parallel_group(with_context_parallel=True)
                 )
+                #debugmtl
+                print_rank_0(f"key: {key}, val: {val}")
                 loss_reduced[key] = val[0] / val[1]
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
@@ -1747,6 +1749,9 @@ def training_log(
                 avg = total_loss_dict[key].item() / float(
                     max(1, total_loss_dict[advanced_iters_key])
                 )
+                #debugmtl
+                print_rank_0(f"in training_log, key: {key}, avg: {total_loss_dict[key].item()}, \
+                 advanced_iters_key: {total_loss_dict[advanced_iters_key]}")
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
@@ -2070,7 +2075,70 @@ def train(
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()
+    # debugmtl
+    def get_debug_hook(layer_name):
+        """
+        这是一个“生产 Hook 的工厂”。
+        调用它会返回一个已经记住了 layer_name 的 hook 函数。
+        """
+        def hook(module, grad_input, grad_output):
+            # 如果没梯度或者梯度为空，直接跳过
+            if not grad_output:
+                return
+            
+            g = grad_output[0]
+            if g is None:
+                return
+            if torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            if rank == 0:
+                # 简单的统计
+                g_float = g.float()
+                g_max = g_float.max().item()
+                g_min = g_float.min().item()
+                g_mean = g_float.mean().item()
+                g_norm = torch.linalg.vector_norm(g_float, ord=2).item()
+                has_nan = torch.isnan(g_float).any().item()
+                
+                # 【关键】这里可以直接打印 layer_name
+                print(f"[Rank {rank}] [BWD] {layer_name:25s} | "
+                      f"Max: {g_max:.4e} | Min: {g_min:.4e} | Mean: {g_mean:.4e} | "
+                      f"Norm: {g_norm:.4e} | NaN: {has_nan}")
+            
+            # 如果发现 NaN，可以加个断点或者报错
+            # if has_nan:
+            #    raise RuntimeError(f"NaN found in {layer_name}")
 
+        return hook
+
+    for chunk_id, model_chunk in enumerate(model):
+        prefix = f"Chunk{chunk_id}"
+        gpt_model = model_chunk.module.module
+        # --- 注册 Embedding ---
+        if hasattr(gpt_model, 'embedding'):
+            # 传入名字 "Embedding"
+            gpt_model.embedding.register_full_backward_hook(
+                get_debug_hook(f"{prefix}.Embedding")
+            )
+            
+        if hasattr(gpt_model, 'output_layer'):
+            # 传入名字 "Embedding"
+            gpt_model.output_layer.register_full_backward_hook(
+                get_debug_hook(f"{prefix}.OutputLayer")
+            )
+
+        # --- 注册 Decoder Layers ---
+        if hasattr(gpt_model, 'decoder') and hasattr(gpt_model.decoder, 'layers'):
+            for i, layer in enumerate(gpt_model.decoder.layers):
+                # 传入名字 "Layer_0", "Layer_1" ...
+                layer.register_full_backward_hook(
+                    get_debug_hook(f"{prefix}.Layer_{i}")
+                )
+        
+        print_rank_0(f">>> {prefix} backward debug hook registered")
+        print_rank_0(f"model chunk is: {model_chunk.module.module}")
+        
+        
     if getattr(args, 'perform_rl_step', False):
         assert has_rl_utils, "RL cannot run without the megatron.rl package"
 

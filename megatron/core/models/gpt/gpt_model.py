@@ -37,6 +37,43 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
+# #debugmtl
+# def get_debug_hook(layer_name):
+#     """
+#     这是一个“生产 Hook 的工厂”。
+#     调用它会返回一个已经记住了 layer_name 的 hook 函数。
+#     """
+#     def hook(grad_output):
+#         # 如果没梯度或者梯度为空，直接跳过
+#         if grad_output is None:
+#             print(f"[Rank {rank}] [BWD] {layer_name:25s} | grad_output is None")
+#             return
+
+#         g = grad_output[0]
+#         if g is None:
+#             return
+#         if torch.distributed.is_initialized():
+#             rank = torch.distributed.get_rank()
+#         # if rank == 0:
+#             # 简单的统计
+#         g_float = g.float()
+#         g_max = g_float.max().item()
+#         g_min = g_float.min().item()
+#         g_mean = g_float.mean().item()
+#         g_norm = torch.linalg.vector_norm(g_float, ord=2).item()
+#         has_nan = torch.isnan(g_float).any().item()
+
+#         # 【关键】这里可以直接打印 layer_name
+#         print(f"[Rank {rank}] [BWD] {layer_name:25s} | "
+#                 f"Max: {g_max:.4e} | Min: {g_min:.4e} | Mean: {g_mean:.4e} | "
+#                 f"Norm: {g_norm:.4e} | NaN: {has_nan}")
+
+#         # 如果发现 NaN，可以加个断点或者报错
+#         # if has_nan:
+#         #    raise RuntimeError(f"NaN found in {layer_name}")
+
+#     return hook
+
 
 class GPTModel(LanguageModule):
     """GPT Transformer language model.
@@ -475,6 +512,9 @@ class GPTModel(LanguageModule):
             preproc_output[:5]
         )
 
+        # #debugmtl
+        # decoder_input.register_hook(get_debug_hook("Embedding_Output"))
+
         rotary_pos_cos_sin = preproc_output[5] if len(preproc_output) == 6 else None
 
         # Run decoder.
@@ -490,6 +530,9 @@ class GPTModel(LanguageModule):
             sequence_len_offset=sequence_len_offset,
             **(extra_block_kwargs or {}),
         )
+
+        # #debugmtl
+        # hidden_states.register_hook(get_debug_hook("Decoder_Output_Before_Head"))
 
         return self._postprocess(
             hidden_states=hidden_states,
@@ -633,6 +676,8 @@ class GPTModel(LanguageModule):
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
 
+        # #debugmtl
+        # logits.register_hook(get_debug_hook("Logits_Output"))
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
             assert (

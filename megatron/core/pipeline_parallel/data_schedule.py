@@ -329,6 +329,27 @@ def wrap_dataloader(
 
         groups, sample_id_groups = scheduler.get_groups_and_subsamples(global_id_seqlens, config)
 
+        # #debugmtl
+        # if parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0:
+        #     k = 0
+        #     for group in sample_id_groups:
+        #         print(f"group {k}: ",end="")
+        #         for i in range(len(group)):
+        #             print(f"GPU-{i}: [",end="")
+        #             for j in range(len(group[i])):
+        #                 print(f"{group[i][j]}-{global_id_seqlens[group[i][j]][1]}, ",end=" ")
+        #             print(f"], ")
+        #         k += 1
+        #         print()
+
+        # debugmtl
+        # set_gbs = set()
+        # for group in sample_id_groups:
+        #     for sub in group:
+        #         set_gbs.update(sub)
+        # assert len(set_gbs) == len(global_id_seqlens),
+        # f"set_gbs length: {len(set_gbs)} != global_ids_this_rank length: {len(global_id_seqlens)}"
+
         batch = _unpack_batch(batch)
         samples_this_rank_with_id = _reroute_samples_to_hdp_ranks(
             batch,
@@ -415,7 +436,9 @@ def wrap_dataloader(
             new_sample["cu_seqlens"] = cu_seqlens
 
             new_samples.append(new_sample)
-
+        # #debugmtl
+        # print(f"rank {parallel_state.get_data_parallel_rank
+        # (with_context_parallel=True)} new_samples length: {len(new_samples)}")
         new_data_iterator = RerunDataIterator(iter(new_samples))
 
         return (
@@ -460,15 +483,28 @@ class NaiveSequencePackingScheduler(BaseScheduler):
         sum_seqlen = 0
         single_microbatch = []
 
+        # debugmtl use 1 seq per microbatch
         for i in range(len(sample_id_seqlens)):
-            if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
-                single_microbatch.append(i)
-                sum_seqlen += sample_id_seqlens[i][1]
-            else:
-                groups.append(single_microbatch)
-                packed_id_groups.append(single_microbatch)
-                single_microbatch = [i]
-                sum_seqlen = sample_id_seqlens[i][1]
+            packed_id_groups.append([i])
+
+        # for i in range(len(sample_id_seqlens)):
+        #     if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
+        #         single_microbatch.append(i)
+        #         sum_seqlen += sample_id_seqlens[i][1]
+        #     else:
+        #         packed_id_groups.append(single_microbatch)
+        #         single_microbatch = [i]
+        #         sum_seqlen = sample_id_seqlens[i][1]
+        # if len(single_microbatch) > 0:
+        #     packed_id_groups.append(single_microbatch)
+
+        # debugmtl
+        gbs_sum = 0
+        for i in packed_id_groups:
+            gbs_sum += len(i)
+        assert gbs_sum == len(
+            sample_id_seqlens
+        ), f"gbs_sum: {gbs_sum} != sample_id_seqlens length: {len(sample_id_seqlens)}"
 
         # we want the number of packed sequences to be multiple of dp_size
         # so we move few samples from previous microbatch
@@ -482,7 +518,7 @@ class NaiveSequencePackingScheduler(BaseScheduler):
                 assert i > 0, "Not enough samples to move"
                 if len(packed_id_groups[i]) > 1:
                     seq_id = packed_id_groups[i].pop()
-                    packed_id_groups[i].append(seq_id)
+                    packed_id_groups.append([seq_id])
                     num_to_move -= 1
                 else:
                     i -= 1
@@ -493,7 +529,9 @@ class NaiveSequencePackingScheduler(BaseScheduler):
             for j in range(self.cp_size * self.dp_size):
                 seq_id = int(i * self.dp_size + j / self.cp_size)
                 sample_id_groups[i].append(packed_id_groups[seq_id])
-
+        # debugmtl
+        # print(f"rank {parallel_state.get_data_parallel_rank(with_context_parallel=True)} \
+        # sample_id_groups: {len(sample_id_groups)}")
         return groups, sample_id_groups
 
 
