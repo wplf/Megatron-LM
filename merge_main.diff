@@ -310,7 +310,7 @@ index 70ccc5e88..1db3b9395 100755
              )
  
 diff --git a/megatron/core/ssm/mamba_mixer.py b/megatron/core/ssm/mamba_mixer.py
-index 91dc266e5..0e1dbac90 100644
+index 91dc266e5..5b698414a 100644
 --- a/megatron/core/ssm/mamba_mixer.py
 +++ b/megatron/core/ssm/mamba_mixer.py
 @@ -284,23 +284,22 @@ class MambaMixer(MegatronModule):
@@ -353,9 +353,29 @@ index 91dc266e5..0e1dbac90 100644
                  if self.conv_init is not None:
                      nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
                  else:
-@@ -328,19 +327,19 @@ class MambaMixer(MegatronModule):
-                 self.nheads_local_tp, device=torch.cuda.current_device(), dtype=config.params_dtype
-             )
+@@ -309,8 +308,8 @@ class MambaMixer(MegatronModule):
+         self.activation = "silu"
+         self.act = nn.SiLU()
+ 
+-        if self.config.perform_initialization:
+-            with get_cuda_rng_tracker().fork():
++        with get_cuda_rng_tracker().fork():
++            if self.config.perform_initialization:
+                 # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+                 dt = torch.exp(
+                     torch.rand(
+@@ -323,24 +322,24 @@ class MambaMixer(MegatronModule):
+                 ).clamp(min=dt_init_floor)
+                 # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+                 inv_dt = dt + torch.log(-torch.expm1(-dt))
+-        else:
+-            inv_dt = torch.empty(
+-                self.nheads_local_tp, device=torch.cuda.current_device(), dtype=config.params_dtype
+-            )
++            else:
++                inv_dt = torch.empty(
++                    self.nheads_local_tp, device=torch.cuda.current_device(), dtype=config.params_dtype
++                )
  
 -        self.dt_bias = nn.Parameter(inv_dt)
 -        setattr(self.dt_bias, "tensor_model_parallel", True)
