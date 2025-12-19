@@ -50,7 +50,7 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import internal_api, deprecated
+from megatron.core.utils import deprecated, internal_api
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
