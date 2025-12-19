@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
-from functools import partial
 from unittest import mock
 
 import einops
@@ -749,9 +748,7 @@ def _test_parallel_attention_correctness(
         init_basic_mock_args(mock_args, 1, 1, bf16=True)
         mock_args.context_parallel_size = 1
         mock_args.sequence_parallel = 1
-        gpt_model = unwrap_model(
-            get_model(partial(initialize_gpt_model, config=transformer_config))
-        )
+        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
 
         # Initialize args and save checkpoint
         init_checkpointing_mock_args(mock_args, ckpt_dir, False)
@@ -791,9 +788,7 @@ def _test_parallel_attention_correctness(
         init_basic_mock_args(mock_args, tp, 1, bf16=True)
         mock_args.context_parallel_size = cp
         mock_args.sequence_parallel = sp
-        gpt_model = unwrap_model(
-            get_model(partial(initialize_gpt_model, config=transformer_config))
-        )
+        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
             with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
                 load_checkpoint(gpt_model, None, None)
