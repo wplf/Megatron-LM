@@ -710,7 +710,9 @@ def _test_parallel_attention_correctness(
     micro_batch_size=4,
 ):
     # Model initialization function
-    def initialize_gpt_model(config, pre_process=True, post_process=True, vp_stage=None):
+    def initialize_gpt_model(
+        config, pre_process=True, post_process=True, vp_stage=None, pg_collection=None
+    ):
         gpt_model = GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
@@ -719,6 +721,7 @@ def _test_parallel_attention_correctness(
             pre_process=pre_process,
             post_process=post_process,
             vp_stage=vp_stage,
+            pg_collection=pg_collection,
         )
         return gpt_model
 
