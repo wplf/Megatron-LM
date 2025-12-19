@@ -324,7 +324,9 @@ class MambaMixer(MegatronModule):
                 inv_dt = dt + torch.log(-torch.expm1(-dt))
             else:
                 inv_dt = torch.empty(
-                    self.nheads_local_tp, device=torch.cuda.current_device(), dtype=config.params_dtype
+                    self.nheads_local_tp,
+                    device=torch.cuda.current_device(),
+                    dtype=config.params_dtype,
                 )
 
             self.dt_bias = nn.Parameter(inv_dt)
