@@ -15,6 +15,7 @@
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .fully_shard import fully_shard, fully_shard_model, fully_shard_optimizer
 from .megatron_fsdp import MegatronFSDP
+from .param_and_grad_buffer import fsdp_no_shard
 from .package_info import (
     __contact_emails__,
     __contact_names__,
@@ -34,6 +35,7 @@ __all__ = [
     "DistributedDataParallelConfig",
     "MegatronFSDP",
     "FSDPDistributedIndex",
+    "fsdp_no_shard",
     "fully_shard",
     "fully_shard_model",
     "fully_shard_optimizer",

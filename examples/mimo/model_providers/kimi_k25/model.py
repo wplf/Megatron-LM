@@ -81,6 +81,18 @@ class KimiK25VLModel(MegatronModule):
             for p in self.mm_projector.parameters():
                 p.requires_grad = False
 
+        # Mark frozen vision modules as non-shardable so FSDP keeps them
+        # replicated, avoiding unnecessary all-gather/reshard communication.
+        try:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp import fsdp_no_shard
+
+            if freeze_vision_model and hasattr(self, "vision_tower"):
+                fsdp_no_shard(self.vision_tower)
+            if freeze_vision_projection and hasattr(self, "mm_projector"):
+                fsdp_no_shard(self.mm_projector)
+        except ImportError:
+            pass
+
     # ------------------------------------------------------------------
     # Vision init
     # ------------------------------------------------------------------
