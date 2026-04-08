@@ -1291,15 +1291,8 @@ def fsdp_no_shard(module_or_param: "torch.nn.Module | torch.nn.Parameter"):
         fsdp_no_shard(model.mm_projector)   # mark another sub-module
         # … then wrap the whole model with MegatronFSDP / FullyShardedDataParallel
     """
-    if isinstance(module_or_param, torch.nn.Module):
-        for param in module_or_param.parameters():
-            param._fsdp_no_shard = True
-    elif isinstance(module_or_param, torch.nn.Parameter):
-        module_or_param._fsdp_no_shard = True
-    else:
-        raise TypeError(
-            f"Expected nn.Module or nn.Parameter, got {type(module_or_param)}"
-        )
+    for param in module_or_param.parameters():
+        param._fsdp_no_shard = True
     return module_or_param
 
 
@@ -2480,7 +2473,9 @@ class ParamAndGradBuffer:
 
             new_param.requires_grad_(old_param.requires_grad)
 
-            for tp_attr in ["_mcore_tp", "_tp_partition_dim", "_tp_duplicated"]:
+            for tp_attr in [
+                "_mcore_tp", "_tp_partition_dim", "_tp_duplicated", "_fsdp_no_shard",
+            ]:
                 if getattr(old_param, tp_attr, None) is not None:
                     setattr(new_param, tp_attr, getattr(old_param, tp_attr))
 
@@ -2635,6 +2630,7 @@ class ParamAndGradBuffer:
                             "_mcore_tp",
                             "_tp_duplicated",
                             "_tp_partition_dim",
+                            "_fsdp_no_shard",
                         ]:
                             if hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))

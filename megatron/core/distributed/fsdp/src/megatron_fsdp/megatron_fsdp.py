@@ -981,6 +981,7 @@ class MegatronFSDP(torch.nn.Module):
             # Skip modules (and their descendants) whose params are all no_shard.
             # These are replicated and never need all-gather/reshard hooks.
             if any(is_submodule(module, ns_mod) for ns_mod in no_shard_modules):
+                logger.debug(f"[fsdp_no_shard] skip descendant: {name}")
                 continue
             if _module_params_all_no_shard(module):
                 no_shard_modules.append(module)
@@ -1044,6 +1045,13 @@ class MegatronFSDP(torch.nn.Module):
                         lambda p: _process_post_backward_gradients([p])
                     )
                 )
+
+        if no_shard_modules:
+            logger.info(
+                f"[fsdp_no_shard] Skipped FSDP hooks for {len(no_shard_modules)} "
+                f"no_shard root module(s): "
+                f"{[m._get_name() for m in no_shard_modules]}"
+            )
 
         # Register root module pre- and post-backward hooks in cases where the
         # forward function of root module is not called, but rather the forward
