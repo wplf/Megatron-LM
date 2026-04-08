@@ -18,7 +18,7 @@ import logging
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
-
+from megatron.core.utils import nvtx_decorator
 import torch
 import torch.nn as nn
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
@@ -677,6 +677,7 @@ class MegatronFSDP(torch.nn.Module):
                 self._params_require_handle_grad.discard(param)
 
         @torch.compiler.disable
+        @nvtx_decorator()
         def _pre_forward_param_unshard(
             module: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]
         ):
@@ -805,6 +806,7 @@ class MegatronFSDP(torch.nn.Module):
                 self.finish_grad_sync()
 
         @torch.compiler.disable
+        @nvtx_decorator()
         def _pre_backward_param_unshard(module: nn.Module, *unused):
             """
             Sub-module pre-backward hook to all-gather the module parameters
@@ -868,6 +870,7 @@ class MegatronFSDP(torch.nn.Module):
             torch.autograd.Variable._execution_engine.queue_callback(_root_post_backward)
 
         @torch.compiler.disable
+        @nvtx_decorator()
         def _post_forward(module: nn.Module, input: Any, output: Any):
             # When composed with module-hook-based activation recomputation, the
             # post-backward hook is responsible for resharding the module parameters
@@ -892,6 +895,7 @@ class MegatronFSDP(torch.nn.Module):
             return output
 
         @torch.compiler.disable
+        @nvtx_decorator()
         def _release_module_fp8_transpose_cache(module: nn.Module, *unused):
             release_params_fp8_transpose_cache(module.parameters(recurse=False))
 
@@ -929,13 +933,29 @@ class MegatronFSDP(torch.nn.Module):
             # on the output tensor(s).
             return module.register_forward_hook(forward_hook)
 
+        def _module_params_all_no_shard(module):
+            """Check if all parameters of a module (including children) are _fsdp_no_shard.
+
+            Returns True if every parameter under this module is marked no_shard,
+            meaning no all-gather/reshard hooks are needed for this module or its
+            descendants.  Returns False if there are no parameters.
+            """
+            params = list(module.parameters())
+            return len(params) > 0 and all(
+                getattr(p, "_fsdp_no_shard", False) for p in params
+            )
+
         def _register_pre_forward_param_unshard_hook(module):
             """
             Register the forward pre-hook to unshard parameters before the forward pass.
             If we are not sharding anything, we do not have a model weight buffer and thus
             have nothing to all-gather / un-shard.
+            Skip for modules whose parameters are all marked _fsdp_no_shard, since they
+            are kept replicated and never need all-gathering.
             """
             if self.ddp_config.data_parallel_sharding_strategy != "no_shard":
+                if _module_params_all_no_shard(module):
+                    return
                 self.forward_pre_hooks[f"{module._get_name()} parameter unshard"] = (
                     module.register_forward_pre_hook(
                         _pre_forward_param_unshard, prepend=True, with_kwargs=True
@@ -947,13 +967,25 @@ class MegatronFSDP(torch.nn.Module):
             Register the backward pre-hook to unshard FSDP unit module parameters
             immediately before the backward pass via attaching a gradient-triggered
             hook to the output tensor(s) of a module during a post-forward hook.
+            Skip for modules whose parameters are all marked _fsdp_no_shard.
             """
+            if _module_params_all_no_shard(module):
+                return
             self.backward_pre_hooks[f"all-gather {module._get_name()} parameters"] = (
                 create_custom_backward_hook(module, _pre_backward_param_unshard)
             )
 
         fsdp_modules = []
+        no_shard_modules = []
         for name, module in root_module.named_modules():
+            # Skip modules (and their descendants) whose params are all no_shard.
+            # These are replicated and never need all-gather/reshard hooks.
+            if any(is_submodule(module, ns_mod) for ns_mod in no_shard_modules):
+                continue
+            if _module_params_all_no_shard(module):
+                no_shard_modules.append(module)
+                continue
+
             if self.enable_fine_grained_param_gather_hook:
                 _register_pre_forward_param_unshard_hook(module)
                 _register_pre_backward_param_unshard_hook(module)
