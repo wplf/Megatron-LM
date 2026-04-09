@@ -18,7 +18,7 @@ import logging
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
-from megatron.core.utils import nvtx_decorator
+
 import torch
 import torch.nn as nn
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
@@ -677,7 +677,6 @@ class MegatronFSDP(torch.nn.Module):
                 self._params_require_handle_grad.discard(param)
 
         @torch.compiler.disable
-        @nvtx_decorator()
         def _pre_forward_param_unshard(
             module: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]
         ):
@@ -806,7 +805,6 @@ class MegatronFSDP(torch.nn.Module):
                 self.finish_grad_sync()
 
         @torch.compiler.disable
-        @nvtx_decorator()
         def _pre_backward_param_unshard(module: nn.Module, *unused):
             """
             Sub-module pre-backward hook to all-gather the module parameters
@@ -870,7 +868,6 @@ class MegatronFSDP(torch.nn.Module):
             torch.autograd.Variable._execution_engine.queue_callback(_root_post_backward)
 
         @torch.compiler.disable
-        @nvtx_decorator()
         def _post_forward(module: nn.Module, input: Any, output: Any):
             # When composed with module-hook-based activation recomputation, the
             # post-backward hook is responsible for resharding the module parameters
@@ -895,7 +892,6 @@ class MegatronFSDP(torch.nn.Module):
             return output
 
         @torch.compiler.disable
-        @nvtx_decorator()
         def _release_module_fp8_transpose_cache(module: nn.Module, *unused):
             release_params_fp8_transpose_cache(module.parameters(recurse=False))
 
@@ -954,8 +950,6 @@ class MegatronFSDP(torch.nn.Module):
             are kept replicated and never need all-gathering.
             """
             if self.ddp_config.data_parallel_sharding_strategy != "no_shard":
-                if _module_params_all_no_shard(module):
-                    return
                 self.forward_pre_hooks[f"{module._get_name()} parameter unshard"] = (
                     module.register_forward_pre_hook(
                         _pre_forward_param_unshard, prepend=True, with_kwargs=True
@@ -969,8 +963,6 @@ class MegatronFSDP(torch.nn.Module):
             hook to the output tensor(s) of a module during a post-forward hook.
             Skip for modules whose parameters are all marked _fsdp_no_shard.
             """
-            if _module_params_all_no_shard(module):
-                return
             self.backward_pre_hooks[f"all-gather {module._get_name()} parameters"] = (
                 create_custom_backward_hook(module, _pre_backward_param_unshard)
             )
