@@ -1259,6 +1259,7 @@ class ParameterGroup:
     is_expert_param: bool = False
     requires_grad: Optional[bool] = None
     fsdp_unit_id: Optional[int] = None
+    fsdp_no_shard: bool = False
     chunk_size_factor: int = 1
     model_weight_buffer: Optional[DataParallelBuffer] = None
     transpose_weight_buffer: Optional[DataParallelBuffer] = None
@@ -1266,6 +1267,33 @@ class ParameterGroup:
     main_grad_buffer: Optional[DataParallelBuffer] = None
     hsdp_wbuf: Optional[DataParallelBuffer] = None
     hsdp_gbuf: Optional[DataParallelBuffer] = None
+
+
+def fsdp_no_shard(module_or_param: "torch.nn.Module | torch.nn.Parameter"):
+    """Mark a module or parameter so that FSDP keeps it replicated (not sharded).
+
+    This is useful for small or frozen sub-modules (e.g. a frozen vision encoder)
+    where sharding would add unnecessary all-gather / reshard communication.
+
+    Args:
+        module_or_param: An ``nn.Module`` (all its parameters are marked) or a
+            single ``nn.Parameter``.
+
+    Returns:
+        The input ``module_or_param`` (for convenient chaining).
+
+    Example::
+
+        from megatron.core.distributed.fsdp.src.megatron_fsdp import fsdp_no_shard
+
+        model = MyModel()
+        fsdp_no_shard(model.vision_tower)   # mark entire sub-module
+        fsdp_no_shard(model.mm_projector)   # mark another sub-module
+        # … then wrap the whole model with MegatronFSDP / FullyShardedDataParallel
+    """
+    for param in module_or_param.parameters():
+        param._fsdp_no_shard = True
+    return module_or_param
 
 
 def _get_parameter_groups(
@@ -1339,6 +1367,7 @@ def _get_parameter_groups(
             is_expert_param=is_expert_parameter(name, param),
             requires_grad=param.requires_grad,
             fsdp_unit_id=None,
+            fsdp_no_shard=getattr(param, "_fsdp_no_shard", False),
         )
 
         # For all the new FSDP unit parameters collected, assign an ID number
@@ -1375,7 +1404,7 @@ def _get_parameter_groups(
         basic_attrs = {
             key: value
             for key, value in group.__dict__.items()
-            if key in ["dtype", "is_expert_param", "requires_grad", "fsdp_unit_id"]
+            if key in ["dtype", "is_expert_param", "requires_grad", "fsdp_unit_id", "fsdp_no_shard"]
         }
         for param in group.params:
             if _does_param_require_new_bucket(param):
@@ -1446,6 +1475,7 @@ def _get_parameter_groups(
                     is_expert_param=group.is_expert_param,
                     requires_grad=group.requires_grad,
                     fsdp_unit_id=group.fsdp_unit_id,
+                    fsdp_no_shard=group.fsdp_no_shard,
                     chunk_size_factor=chunk_size_factor,
                 )
             )
@@ -1824,9 +1854,11 @@ class ParamAndGradBuffer:
             total_comm_bytes += group_comm
 
             # One-line summary for the group
+            no_shard_tag = " no_shard" if group.fsdp_no_shard else ""
             log_lines.append(
                 f"[FSDP_UNIT {group.fsdp_unit_id}] Group {idx}: elems={numel} dtype={group.dtype} "
                 f"bufs={','.join(buf_flags) or 'None'} pad={_bytes_to_mb(group_padded)}"
+                f"{no_shard_tag}"
             )
             # List parameters below
             for param in group.params:
@@ -1969,12 +2001,19 @@ class ParamAndGradBuffer:
             )
 
             # Initialize the model weight buffer from bucket parameters.
+            # Parameters marked with _fsdp_no_shard=True are kept replicated
+            # (is_data_distributed=False) to avoid unnecessary all-gather/reshard
+            # overhead for small or non-trainable modules (e.g. frozen vision encoders).
+            should_shard_model_weights = (
+                is_model_weight_buffer_distributed
+                and model_wbuf_dp_group.size() > 1
+                and not group.fsdp_no_shard
+            )
             if data_parallel_sharding_strategy != "no_shard":
                 group.model_weight_buffer = DataParallelBuffer(
                     self.ddp_config,
                     group.params,
-                    is_data_distributed=is_model_weight_buffer_distributed
-                    and model_wbuf_dp_group.size() > 1,
+                    is_data_distributed=should_shard_model_weights,
                     dtype=param_dtype,
                     device=self.device,
                     data_parallel_group=model_wbuf_dp_group,
@@ -1989,8 +2028,7 @@ class ParamAndGradBuffer:
                     group.transpose_weight_buffer = DataParallelBuffer(
                         self.ddp_config,
                         group.params,
-                        is_data_distributed=is_model_weight_buffer_distributed
-                        and main_buf_dp_group.size() > 1,
+                        is_data_distributed=should_shard_model_weights,
                         dtype=param_dtype,
                         device=self.device,
                         data_parallel_group=main_buf_dp_group,
@@ -2435,7 +2473,9 @@ class ParamAndGradBuffer:
 
             new_param.requires_grad_(old_param.requires_grad)
 
-            for tp_attr in ["_mcore_tp", "_tp_partition_dim", "_tp_duplicated"]:
+            for tp_attr in [
+                "_mcore_tp", "_tp_partition_dim", "_tp_duplicated", "_fsdp_no_shard",
+            ]:
                 if getattr(old_param, tp_attr, None) is not None:
                     setattr(new_param, tp_attr, getattr(old_param, tp_attr))
 
@@ -2590,6 +2630,7 @@ class ParamAndGradBuffer:
                             "_mcore_tp",
                             "_tp_duplicated",
                             "_tp_partition_dim",
+                            "_fsdp_no_shard",
                         ]:
                             if hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))
@@ -3618,6 +3659,9 @@ class AllGatherPipeline:
             # Replace the parameter all-gather event with coalescing event.
             for bucket_id in buckets:
                 bucket_key = self.get_bucket_key(bucket_id, bwd)
+                if bucket_key not in self.param_gather_event_map:
+                    # Bucket was not all-gathered (e.g. replicated/frozen params).
+                    continue
                 _, mark_bucket_ready_to_use = self.param_gather_event_map[bucket_key]
                 self.param_gather_event_map[bucket_key] = (
                     coalescing_event,
@@ -3735,6 +3779,12 @@ class AllGatherPipeline:
         self.recycle_unused_buckets()
         # Allocate an empty bucket to store the module weights.
         bucket = wbuf.fetch_bucket(set_param_data=True)
+
+        if not wbuf.is_data_distributed:
+            # Buffer is replicated (e.g. frozen params), no all-gather needed.
+            self.bucket_status[bucket_key] = BucketStatus.READY_TO_USE
+            return
+
         # All-gather the module weights in each buffer shard into the allocated bucket.
         # Now each rank will have a copy of this FSDP unit module's weights.
         param_gather_event = torch.distributed.all_gather_into_tensor(
