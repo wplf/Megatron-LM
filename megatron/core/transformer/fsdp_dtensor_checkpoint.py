@@ -424,22 +424,50 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         copy_tensor_model_parallel_attributes(w_meta, dist_param)
         copy_tensor_model_parallel_attributes(v_meta, dist_param)
 
-        weight_w = make_fsdp_dtensor(
-            weight_w.data,
-            w_meta,
-            dist_index=megatron_fsdp_dist_index,
-            is_expert_param=is_expert_param,
-            run_check=True,
-            update_uneven_dtensor_chunk_meta=True,
-        )
-        weight_v = make_fsdp_dtensor(
-            weight_v.data,
-            v_meta,
-            dist_index=megatron_fsdp_dist_index,
-            is_expert_param=is_expert_param,
-            run_check=True,
-            update_uneven_dtensor_chunk_meta=True,
-        )
+        # Build explicit DCP chunk metadata for the W/V component shards instead
+        # of running the generic rank-order chunk-metadata path, which issues a
+        # blocking all_gather_object inside checkpoint save and deadlocks under
+        # MFSDP + HybridDeviceOptimizer (issue #4910). Mirrors the GDN fix in
+        # split_gdn_fused below.
+        def _build_swiglu_component_dtensor(local_comp, meta_t, comp_slice_in_flat):
+            chunk_sizes = list(local_comp.shape)
+            chunk_offsets = [0] * meta_t.ndim
+            trailing_numel = math.prod(meta_t.shape[swiglu_shard_axis + 1 :])
+            assert trailing_numel > 0, (
+                f"Invalid SWiGLU component meta shape: {list(meta_t.shape)}"
+            )
+            shard_in_comp = intersection(fsdp_slice, comp_slice_in_flat)
+            if shard_in_comp.start != shard_in_comp.stop:
+                component_start = shard_in_comp.start - comp_slice_in_flat.start
+                assert component_start % trailing_numel == 0, (
+                    f"SWiGLU component shard not aligned with tensor rows: "
+                    f"component_start={component_start}, trailing_numel={trailing_numel}, "
+                    f"meta_shape={list(meta_t.shape)}, fsdp_slice={fsdp_slice}, "
+                    f"comp_slice={comp_slice_in_flat}"
+                )
+                assert local_comp.numel() % trailing_numel == 0, (
+                    f"SWiGLU component shard size not aligned with tensor rows: "
+                    f"numel={local_comp.numel()}, trailing_numel={trailing_numel}"
+                )
+                chunk_offsets[swiglu_shard_axis] = component_start // trailing_numel
+            tp_partition_dim = get_mcore_tensor_parallel_partition_dim(meta_t)
+            if tp_partition_dim is not None:
+                tp_rank = dist.get_rank(tp_mesh.get_group())
+                chunk_offsets[tp_partition_dim] += tp_rank * meta_t.shape[tp_partition_dim]
+            dtensor = make_fsdp_dtensor(
+                local_comp.data,
+                meta_t,
+                dist_index=megatron_fsdp_dist_index,
+                is_expert_param=is_expert_param,
+                run_check=False,
+                update_uneven_dtensor_chunk_meta=False,
+            )
+            _validate_explicit_dtensor_chunk_metadata(dtensor, chunk_offsets, chunk_sizes)
+            _set_explicit_dtensor_chunk_metadata(dtensor, chunk_offsets, chunk_sizes)
+            return dtensor
+
+        weight_w = _build_swiglu_component_dtensor(weight_w, w_meta, w_slice)
+        weight_v = _build_swiglu_component_dtensor(weight_v, v_meta, v_slice)
         return weight_w, weight_v
 
     model_state_dict = model_state_dict.copy()
