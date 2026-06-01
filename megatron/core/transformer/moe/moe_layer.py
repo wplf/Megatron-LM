@@ -243,6 +243,19 @@ class MoELayer(BaseMoELayer):
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
         )
+        # Use recompute-with-discarded-output (CheckpointWithoutOutput) for the shared expert:
+        # discard the shared-expert OUTPUT activation in the forward and regenerate it in the
+        # backward from a grad hook, instead of a standard checkpoint that keeps the output and
+        # only recomputes the intermediates. Only safe when the whole MoE forward runs in a single
+        # call; under MoE cudagraph partial capture the shared-expert output is emitted as a graph
+        # output across separate calls and must keep its storage, so fall back to standard
+        # checkpointing there.
+        self.shared_experts_recompute_discard_output = self.shared_experts_recompute and not bool(
+            getattr(config, "cuda_graph_modules", None)
+        )
+        # Holds the active CheckpointWithoutOutput between shared_experts_compute() and
+        # postprocess() within a single forward call (None when not using discard-output recompute).
+        self.shared_experts_checkpoint = None
 
         self.tp_group = pg_collection.tp
         self.tp_ep_group = pg_collection.tp_ep
@@ -530,7 +543,19 @@ class MoELayer(BaseMoELayer):
         shared_expert_output = None
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
-            if self.shared_experts_recompute:
+            if self.shared_experts_recompute_discard_output and self.training:
+                # Recompute-with-discarded-output: run the shared expert under no_grad, then free
+                # its output in postprocess() and regenerate it (with its backward graph) from a
+                # grad hook. CheckpointWithoutOutput handles fp8/fp4 internally via its fp8 flag.
+                self.shared_experts_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                    fp8=(self.config.fp8 or self.config.fp4)
+                )
+                shared_expert_output = self.shared_experts_checkpoint.checkpoint(
+                    apply_module(self.shared_experts), hidden_states
+                )
+            elif self.shared_experts_recompute:
+                # Standard checkpoint fallback (e.g. MoE cudagraph partial capture or eval): keep
+                # the output, recompute only the intermediates.
                 if self.config.fp8 or self.config.fp4:
                     shared_expert_output = te_checkpoint(
                         apply_module(self.shared_experts),
@@ -733,6 +758,15 @@ class MoELayer(BaseMoELayer):
                     output, shared_expert_output = intermediate_tensors
 
                 output = self.postprocess(output, shared_expert_output)
+
+                # Discard-output recompute for the shared expert: free its output activation now
+                # that the residual add in postprocess() has consumed it, and register the recompute
+                # on `output`. The hook fires when grad reaches `output` (the add result), i.e.
+                # before grad flows into the shared-expert branch, so the output is regenerated in
+                # time for its backward.
+                if self.shared_experts_checkpoint is not None:
+                    self.shared_experts_checkpoint.discard_output_and_register_recompute(output)
+                    self.shared_experts_checkpoint = None
 
                 if intermediate_tensors is not None:
                     return output
