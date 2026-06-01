@@ -683,6 +683,19 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         if not node.is_mtp and final_layernorm and node.is_last_layer:
             output = final_layernorm(output)
             output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
+
+        # Discard-output recompute for the shared expert (A2A-overlap fine-grained path).
+        # shared_experts_compute() ran in the attn node and (when discard-output recompute is on)
+        # created layer.mlp.shared_experts_checkpoint. Its output has now been consumed by
+        # postprocess(); free it and register the recompute on THIS combine node's output. The
+        # combine node's backward runs before the attn node's backward (where the shared-expert
+        # CheckpointWithoutOutputFunction.backward fires via the detached-tensor replay in
+        # backward_impl), so the output is regenerated in time. Mirrors the pre_mlp_norm_checkpoint
+        # handling in submodule_moe_forward.
+        shared_experts_checkpoint = getattr(layer.mlp, "shared_experts_checkpoint", None)
+        if shared_experts_checkpoint is not None:
+            shared_experts_checkpoint.discard_output_and_register_recompute(output)
+            layer.mlp.shared_experts_checkpoint = None
         return output
 
     @copy_signature(layer._forward_mlp, handle_first_dst_param='preserve')
