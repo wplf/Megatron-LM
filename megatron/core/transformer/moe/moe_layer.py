@@ -246,12 +246,19 @@ class MoELayer(BaseMoELayer):
         # Use recompute-with-discarded-output (CheckpointWithoutOutput) for the shared expert:
         # discard the shared-expert OUTPUT activation in the forward and regenerate it in the
         # backward from a grad hook, instead of a standard checkpoint that keeps the output and
-        # only recomputes the intermediates. Only safe when the whole MoE forward runs in a single
-        # call; under MoE cudagraph partial capture the shared-expert output is emitted as a graph
-        # output across separate calls and must keep its storage, so fall back to standard
-        # checkpointing there.
-        self.shared_experts_recompute_discard_output = self.shared_experts_recompute and not bool(
-            getattr(config, "cuda_graph_modules", None)
+        # only recomputes the intermediates.
+        #
+        # This is wired through the fine-grained overlap callables only (build_transformer_layer_
+        # callables): the shared-expert output is produced in the attn node and consumed in the
+        # combine node, so its recompute hook is registered on the moe node's expert_output (after
+        # any pre_mlp_layernorm recompute) and the output is freed in the combine node. The
+        # single-call MoELayer.forward path does not have those ordering hooks, so without overlap
+        # we fall back to a standard checkpoint that keeps the output. Also disabled under MoE
+        # cudagraph partial capture, where the shared-expert output is a graph output.
+        self.shared_experts_recompute_discard_output = (
+            self.shared_experts_recompute
+            and bool(getattr(config, "overlap_moe_expert_parallel_comm", False))
+            and not bool(getattr(config, "cuda_graph_modules", None))
         )
         # Holds the active CheckpointWithoutOutput between shared_experts_compute() and
         # postprocess() within a single forward call (None when not using discard-output recompute).
@@ -758,15 +765,6 @@ class MoELayer(BaseMoELayer):
                     output, shared_expert_output = intermediate_tensors
 
                 output = self.postprocess(output, shared_expert_output)
-
-                # Discard-output recompute for the shared expert: free its output activation now
-                # that the residual add in postprocess() has consumed it, and register the recompute
-                # on `output`. The hook fires when grad reaches `output` (the add result), i.e.
-                # before grad flows into the shared-expert branch, so the output is regenerated in
-                # time for its backward.
-                if self.shared_experts_checkpoint is not None:
-                    self.shared_experts_checkpoint.discard_output_and_register_recompute(output)
-                    self.shared_experts_checkpoint = None
 
                 if intermediate_tensors is not None:
                     return output

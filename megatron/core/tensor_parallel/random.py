@@ -914,6 +914,43 @@ class CheckpointWithoutOutput(object):
         self.outputs = None
         self.ctx = None
 
+    def discard_output(self):
+        """
+        Release the output tensor storages (keeping tensor metadata for backward).
+
+        Use together with :meth:`register_recompute_hook` when the output must be freed in a
+        different place than where the recompute hook is registered (e.g. the output is consumed
+        later than the tensor whose backward must trigger the recompute). For the common case where
+        both happen at once, use :meth:`discard_output_and_register_recompute`.
+        """
+        from megatron.core.transformer.cuda_graphs import is_graph_warmup
+
+        # When ckpt_manager is set, this is a no-op; the manager handles discarding uniformly.
+        if self.ckpt_manager is not None or is_graph_warmup():
+            return
+
+        # use resize to release the output tensor memory and still keep the metadata in the tensors.
+        # the metadata is still needed for backward
+        for output in self.outputs:
+            output.untyped_storage().resize_(0)
+
+    def register_recompute_hook(self, hook_tensor):
+        """
+        Register the recompute function as a grad hook of ``hook_tensor``.
+
+        When the gradient of ``hook_tensor`` is computed, the recomputation is triggered. The
+        ``hook_tensor`` must be selected so that its gradient is computed before the discarded
+        outputs are needed by other backward computations (and, if the recompute itself depends on
+        other discarded activations, after those have been restored).
+        """
+        from megatron.core.transformer.cuda_graphs import is_graph_warmup
+
+        if self.ckpt_manager is not None or is_graph_warmup():
+            return
+
+        if hook_tensor.requires_grad:
+            hook_tensor.register_hook(self._recompute)
+
     def discard_output_and_register_recompute(self, hook_tensor):
         """
         Release the output tensor storages and register the recompute function as a grad hook of
@@ -923,21 +960,5 @@ class CheckpointWithoutOutput(object):
         in the forward pass and the gradient of the hook_tensor is computed before the recomputed
         tensors are used.
         """
-        # When ckpt_manager is set, this is a no-op.
-        # Manager handles all discarding and hook registration uniformly.
-        from megatron.core.transformer.cuda_graphs import is_graph_warmup
-
-        if self.ckpt_manager is not None or is_graph_warmup():
-            return
-
-        # use resize to release the output tensor memory and still keep the metadata in the tensors.
-        # the metadata is still needed for backward
-        for output in self.outputs:
-            output.untyped_storage().resize_(0)
-
-        # register the recomputation as a backward hook, when the the gradient of the hook_tensor
-        # is computed, the recomputation will be triggered. The hook_tensor should be selected
-        # carefully to ensure that the tensors are recomputed before it is used by other backward
-        # computations.
-        if hook_tensor.requires_grad:
-            hook_tensor.register_hook(self._recompute)
+        self.discard_output()
+        self.register_recompute_hook(hook_tensor)

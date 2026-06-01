@@ -634,6 +634,17 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # as a gradient hook of expert_output
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
 
+        # Register the shared-expert recompute on expert_output as well (output freed later in
+        # submodule_combine_forward, after postprocess consumes it). Registering here — AFTER the
+        # pre_mlp_norm recompute above and on the same expert_output tensor — guarantees the shared
+        # expert is recomputed only after pre_mlp_layernorm_output (its input) has been restored,
+        # and still before the attn node's shared-expert backward. expert_output is downstream of
+        # neither the shared-expert path nor pre_mlp_layernorm per se; it is used purely as a
+        # correctly-ordered backward trigger.
+        shared_experts_checkpoint = getattr(layer.mlp, "shared_experts_checkpoint", None)
+        if shared_experts_checkpoint is not None:
+            shared_experts_checkpoint.register_recompute_hook(expert_output)
+
         return expert_output
 
     def submodule_combine_forward(node: ScheduleNode, output: torch.Tensor):
@@ -686,15 +697,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
         # Discard-output recompute for the shared expert (A2A-overlap fine-grained path).
         # shared_experts_compute() ran in the attn node and (when discard-output recompute is on)
-        # created layer.mlp.shared_experts_checkpoint. Its output has now been consumed by
-        # postprocess(); free it and register the recompute on THIS combine node's output. The
-        # combine node's backward runs before the attn node's backward (where the shared-expert
-        # CheckpointWithoutOutputFunction.backward fires via the detached-tensor replay in
-        # backward_impl), so the output is regenerated in time. Mirrors the pre_mlp_norm_checkpoint
-        # handling in submodule_moe_forward.
+        # created layer.mlp.shared_experts_checkpoint; the recompute hook was registered on the moe
+        # node's expert_output in submodule_moe_forward. postprocess() above has now consumed the
+        # shared-expert output, so free its storage here. The recompute (triggered from
+        # expert_output's grad in the moe node backward) regenerates it before the attn node's
+        # shared-expert backward.
         shared_experts_checkpoint = getattr(layer.mlp, "shared_experts_checkpoint", None)
         if shared_experts_checkpoint is not None:
-            shared_experts_checkpoint.discard_output_and_register_recompute(output)
+            shared_experts_checkpoint.discard_output()
             layer.mlp.shared_experts_checkpoint = None
         return output
 
