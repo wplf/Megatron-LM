@@ -29,6 +29,7 @@ from megatron.core.ssm.mamba_context_parallel import (
     _undo_attention_load_balancing,
 )
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -224,16 +225,11 @@ class GatedDeltaNet(MegatronModule):
         self.recompute_qkv = False
         if self.config.recompute_granularity == "selective":
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
-            # Recompute the whole QKV projection + preparation block (in_proj -> CP a2a -> conv1d
-            # -> _prepare_qkv -> g/beta) as one checkpoint, analogous to recompute_modules="moe"
-            # wrapping the entire MoE forward. Frees the large QKV-prep activations (the GDN QKV
-            # prep, ~4x2.42 GB/layer in the 397B proxy profile) at the cost of rerunning the
-            # projection in the backward pass.
+            # gdn_qkv: recompute the whole QKV proj+prep block as a discard-output checkpoint.
             self.recompute_qkv = "gdn_qkv" in self.config.recompute_modules
 
-        # Holds the active CheckpointWithoutOutput for gdn_qkv discard-output recompute, between
-        # the QKV block forward and the recompute-hook registration at the end of forward().
-        self.qkv_checkpoint = None
+        # Per-forward CheckpointManager for the GDN discard-output recompute (gdn_qkv/gdn_norm_out).
+        self.gdn_recompute_manager = None
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -347,29 +343,29 @@ class GatedDeltaNet(MegatronModule):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
-        # QKV projection + preparation block: in_proj -> CP a2a -> conv1d -> _prepare_qkv -> g/beta.
-        # Produces (query, key, value, g, beta, gate). Optionally recomputed as a whole block in
-        # the backward pass when recompute_modules contains "gdn_qkv" (see _compute_qkv... below).
+        # gdn_qkv (QKV proj+prep) and gdn_norm_out (gated norm) are discard-output checkpoints; the
+        # QKV output `gate` feeds the gated-norm block, so when both are on the CheckpointManager
+        # replays them in forward order (qkv -> norm_out) from one grad hook on `out`.
+        recompute_qkv = self.recompute_qkv and self.training
+        recompute_norm_out = self.recompute_norm_out and self.training
+        self.gdn_recompute_manager = (
+            CheckpointManager() if (recompute_qkv or recompute_norm_out) else None
+        )
+
+        # QKV projection + prep block (in_proj -> CP a2a -> conv1d -> _prepare_qkv -> g/beta).
         def _qkv_proj_and_prepare(hidden_states):
             return self._compute_qkv_for_gated_delta_rule(
                 hidden_states, batch, seq_len, cu_seqlens_q, packed_seq_params
             )
 
-        if self.recompute_qkv and self.training:
-            # Discard-output recompute: run the QKV block under no_grad, discard its outputs
-            # (query/key/value/g/beta/gate) and regenerate them in backward from a grad hook
-            # registered on the GDN output `out` (end of forward). Frees the large GDN QKV
-            # activations that a standard checkpoint keeps on device. The recompute reruns the
-            # forward synchronously (no async reload), so it is safe with the fla/compiled
-            # gated_delta_rule backward.
-            self.qkv_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                fp8=(self.config.fp8 or self.config.fp4)
-            )
-            query, key, value, g, beta, gate = self.qkv_checkpoint.checkpoint(
-                _qkv_proj_and_prepare, hidden_states
-            )
+        if recompute_qkv:
+            # Discard the QKV outputs now; regenerate them in backward. Synchronous recompute
+            # (no async reload), so it is safe with the fla/compiled gated_delta_rule backward.
+            query, key, value, g, beta, gate = tensor_parallel.CheckpointWithoutOutput(
+                fp8=(self.config.fp8 or self.config.fp4),
+                ckpt_manager=self.gdn_recompute_manager,
+            ).checkpoint(_qkv_proj_and_prepare, hidden_states)
         else:
-            self.qkv_checkpoint = None
             query, key, value, g, beta, gate = _qkv_proj_and_prepare(hidden_states)
 
         # seq_len was reassigned to the post-CP-a2a sequence length inside the block; recover it
@@ -418,9 +414,10 @@ class GatedDeltaNet(MegatronModule):
 
             return norm_out
 
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            norm_out = self.norm_out_checkpoint.checkpoint(_gated_norm_and_a2a, core_attn_out, gate)
+        if recompute_norm_out:
+            norm_out = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=self.gdn_recompute_manager
+            ).checkpoint(_gated_norm_and_a2a, core_attn_out, gate)
         else:
             norm_out = _gated_norm_and_a2a(core_attn_out, gate)
 
@@ -429,16 +426,11 @@ class GatedDeltaNet(MegatronModule):
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
 
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
-
-        # gdn_qkv discard-output recompute: now that the QKV block outputs have been consumed
-        # (q/k/v/g/beta by gated_delta_rule, gate by the gated norm), free them and register the
-        # recompute on `out`. Its grad is computed at the start of this layer's backward, before
-        # the gated_delta_rule / gated_norm backwards that need the regenerated tensors.
-        if self.qkv_checkpoint is not None:
-            self.qkv_checkpoint.discard_output_and_register_recompute(out)
-            self.qkv_checkpoint = None
+        # Discard the checkpointed outputs (now consumed) and register the unified recompute hook on
+        # `out` — its grad is computed first in backward, before the backwards that need them.
+        if self.gdn_recompute_manager is not None:
+            self.gdn_recompute_manager.discard_all_outputs_and_register_unified_recompute(out)
+            self.gdn_recompute_manager = None
 
         return out, out_bias
 
@@ -447,10 +439,9 @@ class GatedDeltaNet(MegatronModule):
     ):
         """QKV projection + preparation block for the gated delta rule.
 
-        Runs the input projection, CP all-to-all, conv1d, _prepare_qkv and g/beta computation,
-        producing the tensors consumed by ``self.gated_delta_rule`` plus the ``gate`` used by the
-        downstream gated norm. Extracted into its own method so it can be wrapped in an activation
-        checkpoint when ``recompute_modules`` contains ``"gdn_qkv"``.
+        Runs in_proj, CP all-to-all, conv1d, _prepare_qkv and g/beta, producing the tensors consumed
+        by ``self.gated_delta_rule`` plus the ``gate`` for the gated norm. Extracted so it can be
+        checkpointed when ``recompute_modules`` contains ``"gdn_qkv"``.
 
         Returns:
             Tuple of (query, key, value, g, beta, gate).
