@@ -1261,6 +1261,10 @@ def pretrain(
     if args.record_memory_history and (
         is_last_rank() or torch.distributed.get_backend() == 'fake'
     ):
+        # PyTorch's `_record_memory_history` signature has shifted across
+        # 2.4 / 2.5 / 2.6, and the sitecustomize hook injects
+        # `trace_alloc_max_entries`, which the new-style impl rejects. Fall
+        # back to the legacy positional form so device_traces are recorded.
         try:
             torch.cuda.memory._record_memory_history(
                 enabled='all',
@@ -1268,9 +1272,18 @@ def pretrain(
                 stacks='python',
                 max_entries=100000,
             )
-            print_rank_0("[memory_snapshot] enabled torch.cuda.memory event recording (mode=all)")
-        except Exception as _e:  # noqa: BLE001
-            print_rank_0(f"[memory_snapshot] _record_memory_history failed: {_e}")
+            print_rank_0("[memory_snapshot] enabled event recording (new API)")
+        except (TypeError, ValueError, RuntimeError) as _e:
+            print_rank_0(f"[memory_snapshot] new API failed ({_e}); falling back to legacy")
+            try:
+                torch.cuda.memory._record_memory_history(
+                    True,
+                    trace_alloc_max_entries=100000,
+                    trace_alloc_record_context=True,
+                )
+                print_rank_0("[memory_snapshot] enabled event recording (legacy API)")
+            except Exception as _e2:  # noqa: BLE001
+                print_rank_0(f"[memory_snapshot] legacy API also failed: {_e2}")
 
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, checkpointing_context=checkpointing_context
