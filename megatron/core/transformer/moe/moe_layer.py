@@ -248,16 +248,17 @@ class MoELayer(BaseMoELayer):
         # backward from a grad hook, instead of a standard checkpoint that keeps the output and
         # only recomputes the intermediates.
         #
-        # This is wired through the fine-grained overlap callables only (build_transformer_layer_
-        # callables): the shared-expert output is produced in the attn node and consumed in the
-        # combine node, so its recompute hook is registered on the moe node's expert_output (after
-        # any pre_mlp_layernorm recompute) and the output is freed in the combine node. The
-        # single-call MoELayer.forward path does not have those ordering hooks, so without overlap
-        # we fall back to a standard checkpoint that keeps the output. Also disabled under MoE
-        # cudagraph partial capture, where the shared-expert output is a graph output.
+        # The recompute hook must fire AFTER any pre_mlp_layernorm recompute (so the shared
+        # expert's input pre_mlp_layernorm_output is restored first) and before the shared expert's
+        # backward. Two wirings:
+        #   * A2A-overlap (fine-grained callables): register on the moe node's expert_output and
+        #     free the output in the combine node.
+        #   * single-call MoELayer.forward: TransformerLayer._forward_post_mlp frees + registers on
+        #     mlp_output_with_bias[0] right after the pre_mlp_norm recompute.
+        # Disabled under MoE cudagraph partial capture, where the shared-expert output is emitted
+        # as a graph output and must keep its storage.
         self.shared_experts_recompute_discard_output = (
             self.shared_experts_recompute
-            and bool(getattr(config, "overlap_moe_expert_parallel_comm", False))
             and not bool(getattr(config, "cuda_graph_modules", None))
         )
         # Holds the active CheckpointWithoutOutput between shared_experts_compute() and
