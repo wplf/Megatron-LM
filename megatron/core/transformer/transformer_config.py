@@ -543,7 +543,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-             "shared_experts", "mhc", "gdn_norm_out".
+             "shared_experts", "mhc", "gdn_norm_out", "qk_rope".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -556,8 +556,13 @@ class TransformerConfig(ModelParallelConfig):
             CheckpointWithoutOutput + CheckpointManager. Requires
             enable_hyper_connections=True. Cannot be used with "mlp".
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
-    "moe_act", "layernorm", "mla_up_proj", "mhc", and "gdn_norm_out" use output-discarding
-    checkpointing, "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "qk_rope": discard-output recompute of the rotary embedding applied to query/key on the
+            split_qkv path (training only). Recompute alone keeps a same-sized tensor (the rope
+            input) instead of the output, so pair it with "qk_rope" in offload_modules to save
+            GPU memory. Mutually exclusive with "core_attn" recompute/offload.
+    "moe_act", "layernorm", "mla_up_proj", "mhc", "gdn_norm_out", and "qk_rope" use
+    output-discarding checkpointing, "core_attn", "mlp", "moe", and "shared_experts" use
+    normal checkpointing.
     """
 
     ####################
@@ -1231,7 +1236,7 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act".
+             "mlp_norm", "expert_fc1", "moe_act", "qk_rope".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
@@ -1239,6 +1244,10 @@ class TransformerConfig(ModelParallelConfig):
     "mlp_norm": offload the input of the normalization in the mlp part.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
+    "qk_rope": offload the rope input (post-qk-norm q/k) on the split_qkv path (training
+            only). Only effective when "qk_rope" is also in recompute_modules, whose
+            save_for_backward input is what this group offloads (plain rope does not save
+            its input for backward).
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -1763,6 +1772,7 @@ class TransformerConfig(ModelParallelConfig):
                     "shared_experts",
                     "mhc",
                     "gdn_norm_out",
+                    "qk_rope",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1797,6 +1807,37 @@ class TransformerConfig(ModelParallelConfig):
                     "For fused attention, you have no need to set 'core_attn' to recompute. "
                     "Please check that the core_attn recompute is really needed."
                 )
+
+            if "qk_rope" in self.recompute_modules:
+                # qk_rope discard-output recompute releases the rotated q/k after core
+                # attention; core_attn recompute saves those same q/k as its checkpoint
+                # inputs, and core_attn offload offloads the rotated query -- both fight
+                # over the same tensors as qk_rope, so they cannot be combined.
+                if "core_attn" in self.recompute_modules:
+                    raise ValueError(
+                        "qk_rope and core_attn cannot both be in recompute_modules: both "
+                        "target the rotated query/key, so qk_rope's discard would leave "
+                        "core_attn's checkpoint without valid inputs."
+                    )
+                if self.fine_grained_activation_offloading and "core_attn" in self.offload_modules:
+                    raise ValueError(
+                        "qk_rope in recompute_modules is incompatible with core_attn in "
+                        "offload_modules: qk_rope discards the rotated query that core_attn "
+                        "offload tries to move to CPU."
+                    )
+                # Recompute alone keeps a same-sized tensor (the rope input) instead of the
+                # rope output, so it saves no GPU memory unless paired with qk_rope offload.
+                if not (
+                    self.fine_grained_activation_offloading
+                    and "qk_rope" in (self.offload_modules or [])
+                ):
+                    warnings.warn(
+                        "qk_rope is in recompute_modules but not in offload_modules. "
+                        "qk_rope discard-output recompute only saves GPU memory when its "
+                        "save_for_backward input is offloaded (rope input and output are the "
+                        "same size). Add 'qk_rope' to offload_modules with "
+                        "fine_grained_activation_offloading for actual savings."
+                    )
 
             if "shared_experts" in self.recompute_modules:
                 if (
@@ -1918,6 +1959,7 @@ class TransformerConfig(ModelParallelConfig):
                 "attn_norm",
                 "mlp_norm",
                 "qkv_linear",
+                "qk_rope",
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (

@@ -363,6 +363,27 @@ class Attention(MegatronModule, ABC):
             and "attn_proj" in self.config.offload_modules
         )
 
+        # qk_rope: discard-output recompute of the rotary embedding applied to query/key
+        # (split_qkv path). The rotated q/k are released after core attention and recomputed
+        # in backward. Combine with offload (below) to actually save GPU memory: recompute
+        # alone only swaps which same-sized tensor is kept (rope input vs output).
+        self.recompute_qk_rope = (
+            self.config.recompute_granularity == 'selective'
+            and "qk_rope" in self.config.recompute_modules
+        )
+
+        # qk_rope offload: offload the rope input (post-qk-norm q/k) to CPU. Only yields
+        # savings when combined with recompute_qk_rope, whose save_for_backward inputs are
+        # captured by this offload group (plain rope does not save its input for backward).
+        self.offload_qk_rope = (
+            self.config.fine_grained_activation_offloading
+            and "qk_rope" in self.config.offload_modules
+        )
+
+        # Per-forward CheckpointWithoutOutput handle for qk_rope discard-output recompute;
+        # set in forward, consumed (discard + recompute hook) right after core attention.
+        self.qk_rope_checkpoint = None
+
         # Output.
         self.linear_proj = build_module(
             submodules.linear_proj,
@@ -524,6 +545,35 @@ class Attention(MegatronModule, ABC):
             packed_seq_params=packed_seq_params,
             **extra_kwargs,
         )
+
+    def _apply_qk_rope(self, query, key, q_pos_emb, k_pos_emb, cu_seqlens_q, cu_seqlens_kv):
+        """Apply rotary position embedding to query/key for the split_qkv training path.
+
+        Factored out so the rope can be wrapped by ``CheckpointWithoutOutput`` (discard-output
+        recompute) and/or fine-grained activation offloading when ``qk_rope`` is in
+        ``recompute_modules`` / ``offload_modules``. Mirrors the static-batching rope inlined
+        in ``forward``; only used during training (inference keeps the inline path, which has
+        a separate ``inference_context.apply_rotary_emb_query`` branch).
+        """
+        if q_pos_emb is not None:
+            query = apply_rotary_pos_emb(
+                query,
+                q_pos_emb,
+                config=self.config,
+                cu_seqlens=cu_seqlens_q,
+                mscale=_yarn_get_concentration_factor_from_config(self.config),
+                cp_group=self.pg_collection.cp,
+            )
+        if k_pos_emb is not None:
+            key = apply_rotary_pos_emb(
+                key,
+                k_pos_emb,
+                config=self.config,
+                cu_seqlens=cu_seqlens_kv,
+                mscale=_yarn_get_concentration_factor_from_config(self.config),
+                cp_group=self.pg_collection.cp,
+            )
+        return query, key
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
@@ -1290,30 +1340,55 @@ class Attention(MegatronModule, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
 
             if split_qkv:
-                if q_pos_emb is not None:
-                    # TODO VIJAY: simplify
-                    if inference_context is None or inference_context.is_static_batching():
-                        query = apply_rotary_pos_emb(
-                            query,
-                            q_pos_emb,
+                if self.training and (self.recompute_qk_rope or self.offload_qk_rope):
+                    # qk_rope: optionally offload the rope input (post-qk-norm q/k) to CPU
+                    # and/or discard-output recompute the rotated q/k. The offload group
+                    # captures the CheckpointWithoutOutput save_for_backward inputs; the
+                    # rotated q/k are released after core attention and recomputed in
+                    # backward. Training-only; inference uses the inline path below.
+                    qk_rope_manager = off_interface(
+                        self.offload_qk_rope and self.training, query, "qk_rope"
+                    )
+
+                    def _qk_rope_fn(q, k):
+                        return self._apply_qk_rope(
+                            q, k, q_pos_emb, k_pos_emb, cu_seqlens_q, cu_seqlens_kv
+                        )
+
+                    with qk_rope_manager as query:
+                        if self.recompute_qk_rope:
+                            self.qk_rope_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                            query, key = self.qk_rope_checkpoint.checkpoint(
+                                _qk_rope_fn, query, key
+                            )
+                        else:
+                            query, key = _qk_rope_fn(query, key)
+                    query, key = qk_rope_manager.group_offload((query, key))
+                else:
+                    if q_pos_emb is not None:
+                        # TODO VIJAY: simplify
+                        if inference_context is None or inference_context.is_static_batching():
+                            query = apply_rotary_pos_emb(
+                                query,
+                                q_pos_emb,
+                                config=self.config,
+                                cu_seqlens=cu_seqlens_q,
+                                mscale=_yarn_get_concentration_factor_from_config(self.config),
+                                cp_group=self.pg_collection.cp,
+                            )
+                        else:
+                            query = inference_context.apply_rotary_emb_query(
+                                query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
+                            )
+                    if k_pos_emb is not None:
+                        key = apply_rotary_pos_emb(
+                            key,
+                            k_pos_emb,
                             config=self.config,
-                            cu_seqlens=cu_seqlens_q,
+                            cu_seqlens=cu_seqlens_kv,
                             mscale=_yarn_get_concentration_factor_from_config(self.config),
                             cp_group=self.pg_collection.cp,
                         )
-                    else:
-                        query = inference_context.apply_rotary_emb_query(
-                            query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
-                        )
-                if k_pos_emb is not None:
-                    key = apply_rotary_pos_emb(
-                        key,
-                        k_pos_emb,
-                        config=self.config,
-                        cu_seqlens=cu_seqlens_kv,
-                        mscale=_yarn_get_concentration_factor_from_config(self.config),
-                        cp_group=self.pg_collection.cp,
-                    )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
                     mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
@@ -1393,6 +1468,14 @@ class Attention(MegatronModule, ABC):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
+
+        if self.recompute_qk_rope and self.training and self.qk_rope_checkpoint is not None:
+            # The rotated q/k (qk_rope output) were saved by core attention for its backward.
+            # Discard them now and recompute via a grad hook on core_attn_out, whose gradient
+            # is produced (by the downstream proj/gate backward) before core attention's
+            # backward needs q/k -- so the rotation is restored just in time.
+            self.qk_rope_checkpoint.discard_output_and_register_recompute(core_attn_out)
+            self.qk_rope_checkpoint = None
 
         if head_wise_gate is not None:
             nvtx_range_push(suffix="head_wise_attn_gate")
