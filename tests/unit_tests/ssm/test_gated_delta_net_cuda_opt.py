@@ -43,7 +43,7 @@ def _scenario_items():
 @pytest.mark.internal
 def test_gated_delta_net_cuda_opt_correctness_and_optional_perf(dtype):
     scenario_items = _scenario_items()
-    runner.validate_fla_dispatch_sources(scenario_items)
+    runner.validate_dispatch_sources(scenario_items)
 
     torch.manual_seed(123)
     runner.set_env({})

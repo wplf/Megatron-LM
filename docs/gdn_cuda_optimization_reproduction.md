@@ -56,7 +56,21 @@ Use `--loss square_mean` to reproduce the earlier loss used during debugging,
 and add `--fail-on-accuracy` when the command should return non-zero on any
 accuracy mismatch.
 
-Latest B200 spot check for
+The submodule is currently pinned at `mcore_gdn_opt@12605c5` (its `main`/HEAD).
+This is the first training-safe commit of the kernel lineage: the backward
+kernels (`wy_bwd`, `dhu`, `dqkwg`) produce correct, NaN-free gradients at
+`DV_DHU=0`, so the optimized path is safe for both forward and backward. It
+supersedes the earlier pin `9121702`, whose backward kernels produced wrong
+gradients (forward/inference-only).
+
+> **Re-measure pending.** The `loss=sum` spot-check table below was captured on
+> the now-superseded pin `9121702`, where the optimized scenarios *failed* the
+> strict gradient comparison. After the bump to `12605c5` (which fixes those
+> gradients) the table must be regenerated on B200; the numbers below are kept
+> only as the historical record for the old pin and no longer reflect the
+> pinned kernels.
+
+Historical B200 spot check (superseded pin) for
 `B=2,T=8192,H=64,D=128,bf16,loss=sum,warmup=3,repeats=10,rounds=3`
 on Megatron-LM `c42dc298a`, `mcore_gdn_opt@9121702`, and
 `gated_delta_rule_bwd@949c959`:
@@ -68,14 +82,15 @@ on Megatron-LM `c42dc298a`, `mcore_gdn_opt@9121702`, and
 | CUDA all three separate | FAIL | 13420.346 | 1.134x |
 | CUDA all four | FAIL | 12875.528 | 1.182x |
 
-For this direct `loss=sum` GDN-only check, the optimized scenarios still fail
-the strict gradient comparison against the Triton baseline. The current
-production workflow is validated with `loss=square_mean`; the latest B200 full
-workflow validation passed all requested scenarios and measured `CUDA all four`
-at `12895.830 us` (`1.182x`) and `CUDA fwd_h+wy+dv_dhu+dqkwg` at
-`12732.651 us` (`1.197x`). Fresh logs:
+On the old pin this direct `loss=sum` GDN-only check failed the strict gradient
+comparison, so the production workflow was validated with `loss=square_mean`
+instead. That `loss=square_mean` full workflow validation (logged at
+`mcore_gdn_opt@cb51345`) passed all requested scenarios and measured
+`CUDA all four` at `12895.830 us` (`1.182x`) and `CUDA fwd_h+wy+dv_dhu+dqkwg`
+at `12732.651 us` (`1.197x`). Logs:
 `third_party/gdn_doc_loss_sum_20260528_205336.log` and
-`third_party/gdn_full_validation_cb51345_20260528_204219.log`.
+`third_party/gdn_full_validation_cb51345_20260528_204219.log`. With the pin now
+at `12605c5`, re-run the `loss=sum` check above — it is expected to PASS.
 
 ## E2E Pytest
 
