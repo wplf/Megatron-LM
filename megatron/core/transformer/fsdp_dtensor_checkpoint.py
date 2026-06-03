@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import math
 import re
 
 import torch
@@ -31,6 +32,7 @@ try:
         make_fsdp_dtensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        set_explicit_dtensor_chunk_metadata,
         split_dtensor,
         uneven_dtensor_to_full_tensor,
     )
@@ -342,22 +344,47 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         copy_tensor_model_parallel_attributes(w_meta, dist_param)
         copy_tensor_model_parallel_attributes(v_meta, dist_param)
 
-        weight_w = make_fsdp_dtensor(
-            weight_w.data,
-            w_meta,
-            dist_index=megatron_fsdp_dist_index,
-            is_expert_param=is_expert_param,
-            run_check=True,
-            update_uneven_dtensor_chunk_meta=True,
-        )
-        weight_v = make_fsdp_dtensor(
-            weight_v.data,
-            v_meta,
-            dist_index=megatron_fsdp_dist_index,
-            is_expert_param=is_expert_param,
-            run_check=True,
-            update_uneven_dtensor_chunk_meta=True,
-        )
+        def make_swiglu_split_dtensor(data, meta, split_slice):
+            meta_shape = list(meta.shape)
+            trailing_numel = math.prod(meta_shape[swiglu_shard_axis + 1 :])
+            assert trailing_numel > 0, f"Invalid SWiGLU component shape: {meta_shape}"
+
+            shard = intersection(fsdp_slice, split_slice)
+            component_start = 0
+            if shard.start != shard.stop:
+                component_start = shard.start - split_slice.start
+                assert component_start % trailing_numel == 0, (
+                    f"SWiGLU component shard is not aligned with tensor rows: "
+                    f"component_start={component_start}, trailing_numel={trailing_numel}, "
+                    f"meta_shape={meta_shape}, shard={shard}, split_slice={split_slice}"
+                )
+                assert data.numel() % trailing_numel == 0, (
+                    f"SWiGLU component shard size is not aligned with tensor rows: "
+                    f"numel={data.numel()}, trailing_numel={trailing_numel}, "
+                    f"meta_shape={meta_shape}, shard={shard}, split_slice={split_slice}"
+                )
+
+            chunk_offsets = [0] * len(meta_shape)
+            chunk_offsets[swiglu_shard_axis] = component_start // trailing_numel
+            chunk_sizes = list(data.shape)
+            tp_partition_dim = get_mcore_tensor_parallel_partition_dim(meta)
+            if tp_partition_dim is not None:
+                tp_rank = dist.get_rank(tp_mesh.get_group())
+                chunk_offsets[tp_partition_dim] += tp_rank * meta_shape[tp_partition_dim]
+
+            dtensor = make_fsdp_dtensor(
+                data.data,
+                meta,
+                dist_index=megatron_fsdp_dist_index,
+                is_expert_param=is_expert_param,
+                run_check=False,
+                update_uneven_dtensor_chunk_meta=False,
+            )
+            set_explicit_dtensor_chunk_metadata(dtensor, chunk_offsets, chunk_sizes)
+            return dtensor
+
+        weight_w = make_swiglu_split_dtensor(weight_w, w_meta, w_slice)
+        weight_v = make_swiglu_split_dtensor(weight_v, v_meta, v_slice)
         return weight_w, weight_v
 
     model_state_dict = model_state_dict.copy()
@@ -518,7 +545,9 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         dist_index = dist_param.megatron_fsdp_dist_index
         tp_mesh = dist_index.get_submesh([dist_index.tp_dim], is_expert_parallel=False)
 
-        data_size = dist_param.numel() // tp_mesh.mesh.numel()
+        data_size = dist_param.numel()
+        if is_mcore_tensor_model_parallel(dist_param):
+            data_size //= tp_mesh.mesh.numel()
         elems_per_unit = data_size // total_split
 
         if isinstance(data, DTensor):
@@ -564,15 +593,47 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             meta_shape[split_dim] = s
             meta = torch.empty(*meta_shape, device="meta")
             copy_tensor_model_parallel_attributes(meta, dist_param)
+            if (
+                tp_mesh.mesh.numel() > 1
+                and split_dim == 0
+                and global_shape[split_dim] == total_split
+                and not is_mcore_tensor_model_parallel(meta)
+            ):
+                # GDN fused parameters are TP-local but do not always carry MCore TP attrs.
+                # Mark the split tensors as column-sharded so DCP plans distinct TP chunks.
+                meta._tensor_parallel_mode = "column"
+
+            trailing_numel = math.prod(meta_shape[split_dim + 1 :])
+            assert trailing_numel > 0, f"Invalid GDN component shape: {meta_shape}"
+            component_start = 0
+            if shard.start != shard.stop:
+                component_start = shard.start - comp_slice.start
+                assert component_start % trailing_numel == 0, (
+                    f"Unaligned GDN component shard: component_start={component_start}, "
+                    f"trailing_numel={trailing_numel}"
+                )
+                assert comp_data.numel() % trailing_numel == 0, (
+                    f"Unaligned GDN component shard size: numel={comp_data.numel()}, "
+                    f"trailing_numel={trailing_numel}"
+                )
+
+            chunk_offsets = [0] * len(meta_shape)
+            chunk_offsets[split_dim] = component_start // trailing_numel
+            chunk_sizes = list(comp_data.shape)
+            tp_partition_dim = get_mcore_tensor_parallel_partition_dim(meta)
+            if tp_partition_dim is not None:
+                tp_rank = dist.get_rank(tp_mesh.get_group())
+                chunk_offsets[tp_partition_dim] += tp_rank * meta_shape[tp_partition_dim]
 
             dtensor = make_fsdp_dtensor(
                 comp_data.data,
                 meta,
                 dist_index=dist_index,
                 is_expert_param=False,
-                run_check=True,
-                update_uneven_dtensor_chunk_meta=True,
+                run_check=False,
+                update_uneven_dtensor_chunk_meta=False,
             )
+            set_explicit_dtensor_chunk_metadata(dtensor, chunk_offsets, chunk_sizes)
             results.append(dtensor)
             flat_offset += comp_flat
 
