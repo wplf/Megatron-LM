@@ -231,12 +231,17 @@ class GatedDeltaNet(MegatronModule):
         )
         self.recompute_norm_out = False
         self.recompute_qkv = False
+        self.recompute_core = False
         if self.config.recompute_granularity == "selective":
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
             # gdn_qkv: recompute the whole QKV proj+prep block as a discard-output checkpoint.
             self.recompute_qkv = "gdn_qkv" in self.config.recompute_modules
+            # gdn_core: recompute the core chunk gated-delta-rule kernel as a discard-output
+            # checkpoint (discards its chunk_fwd_o / solve_tril / chunk-state intermediates).
+            self.recompute_core = "gdn_core" in self.config.recompute_modules
 
-        # Per-forward CheckpointManager for the GDN discard-output recompute (gdn_qkv/gdn_norm_out).
+        # Per-forward CheckpointManager for the GDN discard-output recompute
+        # (gdn_qkv/gdn_core/gdn_norm_out).
         self.gdn_recompute_manager = None
 
         self.out_proj = build_module(
@@ -355,9 +360,12 @@ class GatedDeltaNet(MegatronModule):
         # QKV output `gate` feeds the gated-norm block, so when both are on the CheckpointManager
         # replays them in forward order (qkv -> norm_out) from one grad hook on `out`.
         recompute_qkv = self.recompute_qkv and self.training
+        recompute_core = self.recompute_core and self.training
         recompute_norm_out = self.recompute_norm_out and self.training
         self.gdn_recompute_manager = (
-            CheckpointManager() if (recompute_qkv or recompute_norm_out) else None
+            CheckpointManager()
+            if (recompute_qkv or recompute_core or recompute_norm_out)
+            else None
         )
 
         # QKV projection + prep block (in_proj -> CP a2a -> conv1d -> _prepare_qkv -> g/beta).
@@ -381,17 +389,33 @@ class GatedDeltaNet(MegatronModule):
         seq_len = value.shape[1]
 
         nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-        )
+
+        # Core chunk gated-delta-rule. output_final_state=False, so the final recurrent state is
+        # always None; return only core_attn_out so the discard-output checkpoint can resize it.
+        def _core_gated_delta_rule(query, key, value, g, beta):
+            core_attn_out, _ = self.gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+                cu_seqlens=cu_seqlens_q,
+            )
+            return core_attn_out
+
+        if recompute_core:
+            # Discard the core output and its internal chunk_fwd_o / solve_tril / chunk-state
+            # intermediates now; regenerate them in backward. The shared CheckpointManager replays
+            # the discard-output checkpoints in forward order (qkv -> core -> norm_out).
+            core_attn_out = tensor_parallel.CheckpointWithoutOutput(
+                fp8=(self.config.fp8 or self.config.fp4),
+                ckpt_manager=self.gdn_recompute_manager,
+            ).checkpoint(_core_gated_delta_rule, query, key, value, g, beta)
+        else:
+            core_attn_out = _core_gated_delta_rule(query, key, value, g, beta)
         nvtx_range_pop(suffix="gated_delta_rule")
 
         def _gated_norm_and_a2a(core_attn_out: torch.Tensor, gate: torch.Tensor):
