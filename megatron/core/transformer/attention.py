@@ -38,6 +38,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
+from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -352,6 +353,18 @@ class Attention(MegatronModule, ABC):
             self.config.fine_grained_activation_offloading
             and "qkv_linear" in self.config.offload_modules
         )
+
+        # attn_qkv: recompute the QKV projection + prep as a discard-output checkpoint
+        # (mirrors gdn_qkv). Mutually exclusive with qkv_linear offload (same tensors).
+        self.recompute_qkv = (
+            self.config.recompute_granularity == 'selective'
+            and "attn_qkv" in self.config.recompute_modules
+        )
+        assert not (self.recompute_qkv and self.offload_qkv_linear), (
+            "attn_qkv recompute and qkv_linear offload are mutually exclusive; use only one"
+        )
+        # Per-forward CheckpointManager for the attn_qkv discard-output recompute.
+        self.attn_recompute_manager = None
 
         self.offload_core_attention = (
             self.config.fine_grained_activation_offloading
@@ -1171,17 +1184,36 @@ class Attention(MegatronModule, ABC):
         if head_wise_gate_enabled:
             assert split_qkv, "head_wise_attn_gate is not supported for unsplit mixed_qkv tensor."
 
-        qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
-        with qkv_linear_manager as hidden_states:
-            qkv_output = self.get_query_key_value_tensors(
+        # attn_qkv recompute: only on the split_qkv training path (all-tensor output) and not in
+        # inference. Discards the projected Q/K/V now; regenerates them in backward via the shared
+        # CheckpointManager (recompute hook registered on the attention output before return).
+        recompute_qkv = (
+            self.recompute_qkv and self.training and split_qkv and inference_context is None
+        )
+        self.attn_recompute_manager = CheckpointManager() if recompute_qkv else None
+
+        def _qkv_proj_and_prepare(hidden_states):
+            return self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
                 split_qkv=split_qkv,
                 output_gate=output_gate,
                 head_wise_gate=head_wise_gate_enabled,
             )
-        # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
-        qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
+
+        if recompute_qkv:
+            qkv_output = tensor_parallel.CheckpointWithoutOutput(
+                fp8=(self.config.fp8 or self.config.fp4),
+                ckpt_manager=self.attn_recompute_manager,
+            ).checkpoint(_qkv_proj_and_prepare, hidden_states)
+        else:
+            qkv_linear_manager = off_interface(
+                self.offload_qkv_linear, hidden_states, "qkv_linear"
+            )
+            with qkv_linear_manager as hidden_states:
+                qkv_output = _qkv_proj_and_prepare(hidden_states)
+            # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
+            qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
@@ -1419,6 +1451,12 @@ class Attention(MegatronModule, ABC):
             output, bias = self.linear_proj(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
+
+        # attn_qkv recompute: discard the checkpointed Q/K/V (now consumed) and register the unified
+        # recompute hook on the attention output so they are regenerated at the start of backward.
+        if self.attn_recompute_manager is not None:
+            self.attn_recompute_manager.discard_all_outputs_and_register_unified_recompute(output)
+            self.attn_recompute_manager = None
 
         self.pg_collection.cp = _orig_cp_group
         return output, bias
